@@ -1,0 +1,308 @@
+;******************** (C) COPYRIGHT HAW-Hamburg ********************
+;* Author : based on a template by Franz Korf
+;* Version : V1.0
+;* Date : 17.06.2022
+;*******************************************************************
+
+
+; Define address of selected GPIO and Timer registers
+PERIPH_BASE     	equ	0x40000000                 ;Peripheral base address
+APB2PERIPH_BASE 	equ	(PERIPH_BASE + 0x00010000)
+AHB1PERIPH_BASE 	equ	(PERIPH_BASE + 0x00020000)
+APB1PERIPH_BASE   equ PERIPH_BASE
+
+GPIOD_BASE			  equ	(AHB1PERIPH_BASE + 0x0C00)
+GPIOF_BASE			  equ	(AHB1PERIPH_BASE + 0x1400)
+TIM2_BASE         equ (APB1PERIPH_BASE + 0x0000)
+	
+GPIO_F_PIN        equ	(GPIOF_BASE + 0x10)
+
+GPIO_D_PIN			  equ	(GPIOD_BASE + 0x10)
+GPIO_D_SET			  equ (GPIOD_BASE + 0x18)
+GPIO_D_CLR			  equ	(GPIOD_BASE + 0x1A)
+	
+TIMER				      equ (TIM2_BASE + 0x24)    ; CNT : current time stamp (32 bit),  resolution
+TIM2_PSC			    equ (TIM2_BASE + 0x28)    ; Prescaler  resolution
+TIM2_ERG			    equ (TIM2_BASE + 0x14)    ; 16 Bit register, Bit 0 : 1 Restart Timer
+
+; Button status of each stopwatch state and current state
+INIT 				      equ 0xDF 	; init
+RUN					      equ 0x7F	; run
+HOLD				      equ 0xBF	; hold
+
+; Timer divisors
+Ten_Minutes 		  equ 10*60*100000 
+One_Minute			  equ 60*100000
+Ten_Seconds			  equ	10*100000
+One_Second			  equ 100000
+Ten_Hundredths 		equ	10000
+One_Hundredths		equ 1000
+	
+  EXTERN initITSboard
+  EXTERN GUI_init
+	EXTERN TP_Init
+	EXTERN initTimer
+	EXTERN lcdSetFont
+	EXTERN lcdGotoXY    ; TFT goto x y function
+	EXTERN lcdPrintS		; TFT output function
+	EXTERN lcdPrintC		; TFT output function	  
+	EXTERN lcdPrintInt
+	EXTERN delay			  ; Delay (ms) function
+		
+	EXTERN displaytime
+	
+
+;********************************************
+; Data section, aligned on 4-byte boundary
+;********************************************
+		AREA MyData, DATA, align = 2
+
+DEFAULT_BRIGHTNESS	DCW   800 ; Standarthelligkeit Wert 800
+User_Instructions	  DCB		"A Stopwatch: To run - press S7. To hold - press S6. To reset - press S5", 0 
+Initial_Time		    DCB		"00:00.00", 0
+Timer_String		    DCB 	"00:00.00", 0 ; initialised to 00:00.00
+Current_State		    DCB		0 ; current stopwatch state
+Previous_State		  DCB		0 ; previous stopwatch state  	
+Start_Of_Run		    DCD		0 ; marks time stopwatch first enters running state 
+
+;********************************************
+; Code section, aligned on 8-byte boundery
+;********************************************
+	AREA |.text|, CODE, READONLY, ALIGN = 3
+
+
+;--------------------------------------------
+; main subroutine
+;--------------------------------------------
+				EXPORT main [CODE]
+	
+main			PROC
+				; Initialisierung der HW
+				bl		initITSboard
+				ldr   	r1, =DEFAULT_BRIGHTNESS
+				ldrh 	r0, [r1]
+				bl   	GUI_init
+				bl  	initTimer
+				ldr 	R1,=TIM2_PSC   			; Set pre scaler such that 1 timer tick represents 10 us										
+				mov 	R0,#(90*10-1) 
+				strh	R0,[R1]
+				ldr 	R1,=TIM2_ERG   			; Restart timer	
+				mov		R0,#0x01
+				strh	R0,[R1]				; Set UG Bit
+				mov 	R0, #24
+				bl  	lcdSetFont
+		
+				; print stopwatch instructions and initial time of 00:00.00
+			
+				ldr 	R0,=User_Instructions
+				bl  	lcdPrintS
+				mov		r0, #9 
+				mov		r1, #6
+				bl		lcdGotoXY		
+				ldr		r0,=Initial_Time
+				bl 		lcdPrintS
+		
+				; r5 points to previous state = 0 (used as initial previous state in first loop) 
+			
+				ldr		r5,=Previous_State
+
+
+superloop		
+        			; --This superloop is split into 2 main sections: the superloop itself, and stopwatch_running which manages the states run and hold  
+				; --States are marked using the Current_State and Previous_State variables as follows: init = 0, run = 2, hold = 3  
+				; --Both variables are updated on each run of the superloop 
+				
+				; read button input and update current state and leds 
+				bl 		read_input 
+											
+				; load current and previous states  
+				ldr		r0,=Current_State
+				ldrb 	r0, [r0]
+				ldrb 	r1, [r5] 	
+				
+				; -- r0: current state 
+				; -- r1: previous state 
+								
+				cmp 	r0, #0 
+				bne stopwatch_running 	; if current state not 0, branch to stopwatch_running  	
+				
+				; if current and previous states 0, no printing required, branch to save_state 
+				cmp r1, #0
+				beq save_state
+				
+				; else is first instance of state 0, print initial time 
+				mov		r0, #9 
+				mov		r1, #6
+				bl		lcdGotoXY		
+				ldr		r0,=Initial_Time
+				bl 		lcdPrintS 
+				
+				; and reset timer 
+				ldr r7,=TIM2_ERG
+				mov r6, #0x01
+				str r6, [r7]
+								
+				; previous state = current state before reading new button input 
+save_state		
+        ldr			r0,=Current_State
+				ldr 	r0, [r0]
+				ldr     r5,=Previous_State
+				strb 	r0, [r5] 
+				
+				;--r5: previous state
+				
+				b superloop
+				
+				
+stopwatch_running  
+				
+				;--r0: current state, either 1 or 3
+				;--r1: previous state 
+				;--r7: timer 	
+				;--r8: start_of_run
+
+				ldr r7, =TIMER
+				ldr r7,[r7]
+				ldr r8,=Start_Of_Run 
+				
+				; if variable Start_Of_Run is 0 (first time stopwatch enters running), Start_Of_Run = current timer time 
+				cmp r8, #0 
+				bne running_time
+				str r7, [r8] 	; Start_Of_Run = timer 
+				
+				; else time to display is TIMER - Start_Of_Run 
+running_time	
+        			ldr r8,=Start_Of_Run
+				ldr r8, [r8]
+				sub r7, r8 
+				
+				; print time if current state not 3 (hold) 
+output 			
+        			cmp r0, #3 				
+				bne print_time
+				b save_state 	; else previous state = current state and return to top of superloop
+				
+				
+				
+				BAL		superloop				; End of superloop
+				
+				ENDP
+		
+; prints formatted time onto display 
+print_time 		PROC 
+		
+				; r7: timer 
+				; r5: ASCII prefix 
+				; r6: Timer_String
+				
+				mov 	r5, #0x30 	; ASCII prefix 
+				ldr 	r6, =Timer_String	
+				
+				; 10 minutes
+				ldr 	r1,=Ten_Minutes
+				bl 	extract_char
+				strb 	r2,[r6], #1	; store char in Timer_String i = 0, increment i by 1 
+				
+				; 1 minute
+				ldr 	r1,=One_Minute 
+				bl 	extract_char
+				strb 	r2,[r6], #2 	; store char in Timer_String i = 1, increment i by 2 
+				
+				; i(2) = ":"  
+				
+				; 10 seconds 
+				ldr 	r1,=Ten_Seconds
+				bl 	extract_char
+				strb 	r2,[r6], #1 	; store char in Timer_String i = 3, increment i by 1 
+					
+				; 1 second
+				ldr 	r1,=One_Second
+				bl		extract_char
+				strb	r2,[r6], #2 	; store char in Timer_String i = 4, increment i by 2
+				
+				; i(5) = "."  
+				
+				; 10 hundredths 
+				ldr 	r1,=Ten_Hundredths
+				bl 	extract_char
+				strb 	r2,[r6], #1	; store char in Timer_String i = 6, increment i by 1 	
+				
+				; 1 hundredths 
+				ldr 	r1,=One_Hundredths 
+				udiv 	r2, r7, r1 	; get value = r2
+				add 	r2, r2, r5 	; add ASCII prefix to value
+				strb 	r2,[r6]  	; store char in Timer_String i = 7
+				
+				;print Timer_String
+				mov 	r0, #9
+				mov 	r1, #6
+				bl 	lcdGotoXY 
+				ldr 	r0,=Timer_String
+				bl 	lcdPrintS
+				
+				b save_state		; previous state = current state, return to top of superloop 
+				
+				ENDP 
+	
+; helper for print_time: extracts each timer character, returns remainder as new timer value 
+extract_char	PROC
+				
+				udiv	r2, r7, r1 	; value of current char in r2
+				mul	r3, r2, r1 	; multiply by current divisor and subtract from timer value 
+				sub	r7, r7, r3 	; remainder = new timer value
+				add 	r2, r2, r5 	; add ASCII prefix to value 
+				bx 	lr
+				
+				ENDP		
+				
+
+
+; reads button input and updates Current_State and leds 
+read_input		PROC	
+				
+				ldr	r0,=GPIO_F_PIN 
+				ldrb 	r0, [r0] 	 
+				ldr 	r1,=Current_State 	
+				
+				;--r0 = button input
+				;--r1 = Stopwatch_State
+								
+				;if init, set Current_State to 0 = 0000 0000 0000 0000
+compare_init			cmp 	r0, #INIT 
+				bne 	compare_run
+				mov 	r2, #0 ;   
+				strb 	r2, [r1] 
+				b 		switch_leds 
+								
+				;if run, set Current_State to 1 = 0000 0000 0000 0001
+compare_run			cmp	r0, #RUN
+				bne compare_hold
+				mov r2, #1 ;   
+				strb r2, [r1]
+				b switch_leds 
+				
+				;if hold, set Current_State to 3 = 0000 0000 0000 0011
+compare_hold			cmp	r0, #HOLD
+				bne switch_leds
+				mov r2, #3 ;  
+				strb r2, [r1]
+				b switch_leds 
+								
+switch_leds			;--r2: Current_State
+				ldrb r2,[r1]
+				
+				; switch LEDs off				
+				LDR	R4,=GPIO_D_CLR 
+				mov 	r3, #0xFFFF
+				str	r3, [r4]
+				
+				; switch LEDs on
+				LDR	R4,=GPIO_D_SET
+				str	r2, [r4] 	; Current_State switches corresponding leds on 
+				
+				bx lr 	
+				ENDP 
+
+
+				ALIGN
+				END
